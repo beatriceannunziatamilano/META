@@ -1,0 +1,220 @@
+"""
+Thresholding + FDR + significant/not heatmaps for RQ1 outputs.
+
+Expected inputs (produced by the updated pipeline):
+- P_cortex_combined.csv (and optionally P_subctx_combined.csv)
+- (Optionally) Z_cortex_combined.csv for plotting Z only where significant
+
+This script:
+1) thresholds p < alpha
+2) applies BH-FDR (q < alpha)
+3) saves boolean masks
+4) makes "significant/not" heatmaps (binary)
+
+Author: Beatrice pipeline helper
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# -----------------------
+# CONFIG
+# -----------------------
+ALPHA = 0.05
+MEASURE = "combined"   # e.g., "combined", "spearman", "cosine", "euclidean"
+COMPARTMENT = "cortex" # "cortex" or "subctx"
+GROUPS = ["adults_all", "adolescents_all", "adults_ctx", "adolescents_ctx"]
+
+# Change these if needed:
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MAIN_OUTDIR = os.path.join(REPO_DIR, "ALL_outputs_RQ1")
+
+OUT_SUBDIR = "significance_outputs"
+MAKE_PLOTS = True
+PLOT_MAX_TICKS = 30  # reduce tick labels if huge matrices
+
+
+# -----------------------
+# FDR (Benjamini–Hochberg)
+# -----------------------
+def bh_fdr(pvals_flat, alpha=0.05):
+    """
+    Benjamini-Hochberg FDR control.
+    Input: 1D array-like of p-values (may contain nan).
+    Returns:
+      reject_flat: boolean array same shape as pvals_flat, True if significant under BH at level alpha
+      qvals_flat: BH-adjusted q-values (nan preserved)
+    """
+    p = np.asarray(pvals_flat, dtype=float)
+    reject = np.zeros_like(p, dtype=bool)
+    qvals = np.full_like(p, np.nan, dtype=float)
+
+    valid = np.isfinite(p)
+    pv = p[valid]
+    m = pv.size
+    if m == 0:
+        return reject, qvals
+
+    order = np.argsort(pv)
+    pv_sorted = pv[order]
+
+    # BH critical values
+    crit = alpha * (np.arange(1, m + 1) / m)
+    below = pv_sorted <= crit
+    if np.any(below):
+        kmax = np.max(np.where(below)[0])
+        thresh = pv_sorted[kmax]
+        reject_valid = pv <= thresh
+    else:
+        reject_valid = np.zeros(m, dtype=bool)
+
+    # q-values (adjusted p-values)
+    # q_i = min_{j>=i} (m/j * p_(j))
+    mult = m / np.arange(1, m + 1)
+    q_sorted = pv_sorted * mult
+    q_sorted = np.minimum.accumulate(q_sorted[::-1])[::-1]
+    q_sorted = np.clip(q_sorted, 0, 1)
+
+    # scatter back
+    reject[valid] = reject_valid
+    qvals_valid = np.empty(m, dtype=float)
+    qvals_valid[order] = q_sorted
+    qvals[valid] = qvals_valid
+
+    return reject, qvals
+
+
+def bh_fdr_matrix(P, alpha=0.05, mode="global"):
+    """
+    Apply BH-FDR to a 2D matrix of p-values.
+
+    mode:
+      - "global": all tests together (default; most common for a heatmap)
+      - "by_col": separate BH per column (e.g., control within each SUD)
+      - "by_row": separate BH per row (e.g., control within each PSY)
+    Returns:
+      reject (bool DataFrame), qvals (DataFrame)
+    """
+    P_arr = P.to_numpy(dtype=float)
+    reject = np.zeros_like(P_arr, dtype=bool)
+    qvals = np.full_like(P_arr, np.nan, dtype=float)
+
+    if mode == "global":
+        rej_flat, q_flat = bh_fdr(P_arr.ravel(), alpha=alpha)
+        reject = rej_flat.reshape(P_arr.shape)
+        qvals = q_flat.reshape(P_arr.shape)
+
+    elif mode == "by_col":
+        for j in range(P_arr.shape[1]):
+            rej, q = bh_fdr(P_arr[:, j], alpha=alpha)
+            reject[:, j] = rej
+            qvals[:, j] = q
+
+    elif mode == "by_row":
+        for i in range(P_arr.shape[0]):
+            rej, q = bh_fdr(P_arr[i, :], alpha=alpha)
+            reject[i, :] = rej
+            qvals[i, :] = q
+    else:
+        raise ValueError('mode must be one of ["global","by_col","by_row"]')
+
+    reject_df = pd.DataFrame(reject, index=P.index, columns=P.columns)
+    qvals_df = pd.DataFrame(qvals, index=P.index, columns=P.columns)
+    return reject_df, qvals_df
+
+
+# -----------------------
+# Plotting helpers
+# -----------------------
+def _thin_ticklabels(ax, nrows, ncols, max_ticks=30):
+    """Reduce tick labels for readability on large matrices."""
+    # y
+    if nrows > max_ticks:
+        step = int(np.ceil(nrows / max_ticks))
+        ax.set_yticks(np.arange(0, nrows, step))
+        ax.set_yticklabels([ax.get_yticklabels()[k].get_text() for k in range(0, nrows, step)])
+    # x
+    if ncols > max_ticks:
+        step = int(np.ceil(ncols / max_ticks))
+        ax.set_xticks(np.arange(0, ncols, step))
+        ax.set_xticklabels([ax.get_xticklabels()[k].get_text() for k in range(0, ncols, step)], rotation=90)
+
+
+def plot_binary_heatmap(mask_df, title, out_png):
+    """
+    Plot a binary heatmap (significant/not).
+    mask_df: DataFrame of booleans
+    """
+    M = mask_df.to_numpy(dtype=int)
+    fig, ax = plt.subplots(figsize=(max(6, 0.35 * M.shape[1]), max(6, 0.25 * M.shape[0])))
+    im = ax.imshow(M, aspect="auto", interpolation="nearest")  # default colormap
+    ax.set_title(title)
+    ax.set_xlabel("SUD")
+    ax.set_ylabel("Psychiatric disorder")
+    ax.set_xticks(np.arange(mask_df.shape[1]))
+    ax.set_xticklabels(mask_df.columns, rotation=90)
+    ax.set_yticks(np.arange(mask_df.shape[0]))
+    ax.set_yticklabels(mask_df.index)
+    _thin_ticklabels(ax, mask_df.shape[0], mask_df.shape[1], max_ticks=PLOT_MAX_TICKS)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+
+
+# -----------------------
+# Main runner
+# -----------------------
+def run_for_group(group_label, compartment, measure, alpha=0.05):
+    outdir = os.path.join(MAIN_OUTDIR, group_label)
+    sig_dir = os.path.join(outdir, OUT_SUBDIR)
+    os.makedirs(sig_dir, exist_ok=True)
+
+    p_path = os.path.join(outdir, f"P_{compartment}_{measure}.csv")
+    if not os.path.exists(p_path):
+        raise FileNotFoundError(f"Missing p-values file: {p_path}")
+
+    P = pd.read_csv(p_path, index_col=0)
+
+    # 1) raw threshold mask
+    mask_raw = (P < alpha) & np.isfinite(P)
+    mask_raw = mask_raw.astype(bool)
+
+    # 2) BH-FDR masks
+    mask_fdr_global, q_global = bh_fdr_matrix(P, alpha=alpha, mode="global")
+    mask_fdr_bycol, q_bycol = bh_fdr_matrix(P, alpha=alpha, mode="by_col")
+
+    # Save masks + q-values
+    mask_raw.to_csv(os.path.join(sig_dir, f"MASK_raw_p<{alpha}_{compartment}_{measure}.csv"))
+    mask_fdr_global.to_csv(os.path.join(sig_dir, f"MASK_FDR_global_q<{alpha}_{compartment}_{measure}.csv"))
+    mask_fdr_bycol.to_csv(os.path.join(sig_dir, f"MASK_FDR_bycol_q<{alpha}_{compartment}_{measure}.csv"))
+
+    q_global.to_csv(os.path.join(sig_dir, f"Q_FDR_global_{compartment}_{measure}.csv"))
+    q_bycol.to_csv(os.path.join(sig_dir, f"Q_FDR_bycol_{compartment}_{measure}.csv"))
+
+    # 3) Plots
+    if MAKE_PLOTS:
+        plot_binary_heatmap(
+            mask_raw,
+            title=f"{group_label} | {compartment} | {measure} | raw p < {alpha}",
+            out_png=os.path.join(sig_dir, f"HEATMAP_raw_p<{alpha}_{compartment}_{measure}.png"),
+        )
+        plot_binary_heatmap(
+            mask_fdr_global,
+            title=f"{group_label} | {compartment} | {measure} | BH-FDR global q < {alpha}",
+            out_png=os.path.join(sig_dir, f"HEATMAP_FDR_global_q<{alpha}_{compartment}_{measure}.png"),
+        )
+        plot_binary_heatmap(
+            mask_fdr_bycol,
+            title=f"{group_label} | {compartment} | {measure} | BH-FDR by SUD (per-col) q < {alpha}",
+            out_png=os.path.join(sig_dir, f"HEATMAP_FDR_bycol_q<{alpha}_{compartment}_{measure}.png"),
+        )
+
+    print(f"✅ Done: {group_label} | {compartment} | {measure}")
+    print(f"   Saved to: {sig_dir}")
+
+
+if __name__ == "__main__":
+    for g in GROUPS:
+        run_for_group(g, compartment=COMPARTMENT, measure=MEASURE, alpha=ALPHA)

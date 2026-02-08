@@ -1,0 +1,392 @@
+import os
+import numpy as np
+import pandas as pd
+
+from enigmatoolbox.utils.parcellation import parcel_to_surface
+from enigmatoolbox.plotting import plot_cortical, plot_subcortical
+
+# ======================
+# CONFIG (WINDOWS)
+# ======================
+BASE = r"C:\Users\giaco\Desktop\Git_META\META\data\raw"
+OUTDIR = r"C:\Users\giaco\Desktop\Git_META\META\results\RQ1_3_GM"
+os.makedirs(OUTDIR, exist_ok=True)
+
+PATH_SUD = os.path.join(BASE, "SUD.xlsx")
+PATH_PSY_ADULTS_ALL = os.path.join(BASE, "PSY_adults.xlsx")
+PATH_PSY_ADO_ALL = os.path.join(BASE, "PSY_adolescents.xlsx")
+PATH_PSY_ADO_CTX = os.path.join(BASE, "PSY_adolescents_ctx.xlsx")
+
+# ✅ NEW: add p/q-value files (FDR q-values per region, per disorder)
+# These Excel files must have the SAME SHAPE & ORDER as the corresponding Cohen's d files:
+# rows = 68 cortex + 14 subcortex (same order), cols = disorders (same names)
+PATH_SUD_Q = os.path.join(BASE, "SUD_FDRq.xlsx")
+PATH_PSY_ADULTS_ALL_Q = os.path.join(BASE, "PSY_adults_FDRq.xlsx")
+PATH_PSY_ADO_ALL_Q = os.path.join(BASE, "PSY_adolescents_FDRq.xlsx")
+PATH_PSY_ADO_CTX_Q = os.path.join(BASE, "PSY_adolescents_ctx_FDRq.xlsx")
+
+TOP_PCTS = [0.10, 0.20]
+ALPHA_Q = 0.05  # ✅ FDR threshold
+
+CTX_SLICE = slice(0, 68)
+SCTX_N = 14
+
+PLOT_KW_OVERLAP = dict(
+    cmap="Blues",
+    color_bar=True,
+    size=(1200, 1200),
+    scale=(3, 3),
+    background=(1, 1, 1),
+)
+
+# ======================
+# REGION LABELS
+# ======================
+DKT68 = [
+    "lh_bankssts","lh_caudalanteriorcingulate","lh_caudalmiddlefrontal","lh_cuneus",
+    "lh_entorhinal","lh_fusiform","lh_inferiorparietal","lh_inferiortemporal",
+    "lh_isthmuscingulate","lh_lateraloccipital","lh_lateralorbitofrontal","lh_lingual",
+    "lh_medialorbitofrontal","lh_middletemporal","lh_parahippocampal","lh_paracentral",
+    "lh_parsopercularis","lh_parsorbitalis","lh_parstriangularis","lh_pericalcarine",
+    "lh_postcentral","lh_posteriorcingulate","lh_precentral","lh_precuneus",
+    "lh_rostralanteriorcingulate","lh_rostralmiddlefrontal","lh_superiorfrontal","lh_superiorparietal",
+    "lh_superiortemporal","lh_supramarginal","lh_frontalpole","lh_temporalpole",
+    "lh_transversetemporal","lh_insula",
+    "rh_bankssts","rh_caudalanteriorcingulate","rh_caudalmiddlefrontal","rh_cuneus",
+    "rh_entorhinal","rh_fusiform","rh_inferiorparietal","rh_inferiortemporal",
+    "rh_isthmuscingulate","rh_lateraloccipital","rh_lateralorbitofrontal","rh_lingual",
+    "rh_medialorbitofrontal","rh_middletemporal","rh_parahippocampal","rh_paracentral",
+    "rh_parsopercularis","rh_parsorbitalis","rh_parstriangularis","rh_pericalcarine",
+    "rh_postcentral","rh_posteriorcingulate","rh_precentral","rh_precuneus",
+    "rh_rostralanteriorcingulate","rh_rostralmiddlefrontal","rh_superiorfrontal","rh_superiorparietal",
+    "rh_superiortemporal","rh_supramarginal","rh_frontalpole","rh_temporalpole",
+    "rh_transversetemporal","rh_insula",
+]
+
+SV14 = [
+    "Left-Accumbens","Left-Amygdala","Left-Caudate","Left-Hippocampus",
+    "Left-Pallidum","Left-Putamen","Left-Thalamus",
+    "Right-Accumbens","Right-Amygdala","Right-Caudate","Right-Hippocampus",
+    "Right-Pallidum","Right-Putamen","Right-Thalamus",
+]
+
+# ======================
+# CLUSTERS (ADULTS ONLY)
+# ======================
+CLUSTERS = {
+    "Psychotic": ["SCZ", "BD", "CHR"],
+    "Neurodevelopmental": ["ASD", "ADHD"],
+    "AN_OCD": ["AN", "OCD"],
+    "Mood_Anxiety": ["MDD", "PTSD"],
+}
+
+# ======================
+# HELPERS
+# ======================
+def read_excel_numeric(path):
+    df = pd.read_excel(path)
+    return df.apply(pd.to_numeric, errors="coerce")
+
+def split_ctx_sctx(df):
+    ctx = df.iloc[CTX_SLICE, :].copy()
+    sctx = df.iloc[-SCTX_N:, :].copy()
+    return ctx, sctx
+
+def ensure_unique_cols(df, prefix):
+    df = df.copy()
+    df.columns = [f"{prefix}{c}" for c in df.columns.astype(str)]
+    return df
+
+def pad_subcortex(data14):
+    padded = np.zeros(16)
+    padded[:7] = data14[:7]
+    padded[7] = np.nan
+    padded[8:15] = data14[7:14]
+    padded[15] = np.nan
+    return padded
+
+def align_X_Q(X, Q):
+    """Ensure X and Q have identical row/col alignment before filtering."""
+    X = X.apply(pd.to_numeric, errors="coerce")
+    Q = Q.apply(pd.to_numeric, errors="coerce")
+    X, Q = X.align(Q, join="inner", axis=0)
+    X, Q = X.align(Q, join="inner", axis=1)
+    return X, Q
+
+# ======================
+# OVERLAP CORE
+# ✅ NEW: FDR (q<alpha) filter PER COLUMN before top-k selection,
+# then compute overlap score as RMS between PSY and SUD fractions.
+# ======================
+def compute_overlap_rms_negative_tail_topk_fdr(X, Q, top_pct, region_labels, alpha=0.05, separator="|"):
+    X, Q = align_X_Q(X, Q)
+
+    n_regions, n_disorders = X.shape
+    k = max(1, int(np.ceil(top_pct * n_regions)))
+
+    bins = np.zeros((n_regions, n_disorders), dtype=int)
+
+    for j, col in enumerate(X.columns):
+        vals = X[col].to_numpy(float)   # Cohen's d
+        qvals = Q[col].to_numpy(float)  # FDR q-values
+
+        ok = np.isfinite(vals) & np.isfinite(qvals) & (qvals < alpha)
+        idx_ok = np.where(ok)[0]
+        if len(idx_ok) == 0:
+            continue
+
+        # among significant regions only, select most negative (top-k)
+        k_eff = min(k, len(idx_ok))
+        topk = idx_ok[np.argsort(vals[idx_ok])][:k_eff]
+        bins[topk, j] = 1
+
+    sud_idx = [i for i, c in enumerate(X.columns) if c.startswith("SUD_")]
+    psy_idx = [i for i, c in enumerate(X.columns) if not c.startswith("SUD_")]
+
+    n_sud = len(sud_idx)
+    n_psy = len(psy_idx)
+
+    sud_frac = bins[:, sud_idx].sum(axis=1) / n_sud if n_sud > 0 else np.zeros(n_regions)
+    psy_frac = bins[:, psy_idx].sum(axis=1) / n_psy if n_psy > 0 else np.zeros(n_regions)
+
+    # ✅ RMS (mean quadratica) across the two family-level fractions
+    overlap_rms = np.sqrt((sud_frac**2 + psy_frac**2) / 2.0)
+
+    overlap_disorders = []
+    for i in range(n_regions):
+        idx = np.where(bins[i] == 1)[0]
+        overlap_disorders.append(separator.join(X.columns[idx]) if len(idx) else "")
+
+    out = pd.DataFrame({
+        "region": region_labels,
+        "overlap_RMS": overlap_rms,
+        "psy_frac": psy_frac,
+        "sud_frac": sud_frac,
+        "overlap_disorders": overlap_disorders,
+    })
+
+    meta = dict(
+        n_regions=n_regions,
+        n_disorders=n_disorders,
+        n_psy=n_psy,
+        n_sud=n_sud,
+        top_pct=top_pct,
+        alpha=alpha,
+        overlap_metric="RMS",
+        selection="topk_negative_among_FDR_significant",
+    )
+
+    return out, meta
+
+# ======================
+# OUTPUTS
+# ======================
+def save_outputs(tag, out_df, meta):
+    out_df.to_csv(
+        os.path.join(OUTDIR, f"{tag}_overlap_top{int(meta['top_pct']*100)}_q{meta['alpha']}.csv"),
+        index=False,
+    )
+
+def plot_overlap_ctx(tag, out_df, top_pct):
+    vals = out_df["overlap_RMS"].to_numpy(float)
+    CT = parcel_to_surface(vals, "aparc_fsa5")
+    plot_cortical(
+        array_name=CT,
+        surface_name="fsa5",
+        color_range=(0, 1),
+        screenshot=True,
+        filename=os.path.join(OUTDIR, f"{tag}_cortex_top{int(top_pct*100)}_q{ALPHA_Q}.png"),
+        **PLOT_KW_OVERLAP,
+    )
+
+def plot_overlap_sctx(tag, out_df, top_pct):
+    vals14 = out_df["overlap_RMS"].to_numpy(float)
+    vals16 = pad_subcortex(vals14)
+    plot_subcortical(
+        vals16,
+        color_range=(0, 1),
+        screenshot=True,
+        filename=os.path.join(OUTDIR, f"{tag}_subcortex_top{int(top_pct*100)}_q{ALPHA_Q}.png"),
+        **PLOT_KW_OVERLAP,
+    )
+
+# ======================
+# BUILD MATRICES (Cohen's d)
+# ======================
+def build_adults_ctx():
+    sud = read_excel_numeric(PATH_SUD).drop(columns=["SUD"], errors="ignore")
+    psyA = read_excel_numeric(PATH_PSY_ADULTS_ALL)
+    sud_ctx, _ = split_ctx_sctx(sud)
+    psyA_ctx, _ = split_ctx_sctx(psyA)
+    return pd.concat([
+        ensure_unique_cols(sud_ctx, "SUD_"),
+        ensure_unique_cols(psyA_ctx, "PSYad_"),
+    ], axis=1)
+
+def build_adults_sctx():
+    sud = read_excel_numeric(PATH_SUD).drop(columns=["SUD"], errors="ignore")
+    psyA = read_excel_numeric(PATH_PSY_ADULTS_ALL)
+    _, sud_s = split_ctx_sctx(sud)
+    _, psyA_s = split_ctx_sctx(psyA)
+    return pd.concat([
+        ensure_unique_cols(sud_s, "SUD_"),
+        ensure_unique_cols(psyA_s, "PSYad_"),
+    ], axis=1)
+
+def build_adolescents_ctx():
+    sud = read_excel_numeric(PATH_SUD).drop(columns=["SUD"], errors="ignore")
+    psyP = read_excel_numeric(PATH_PSY_ADO_ALL)
+    psyP_ctx_only = read_excel_numeric(PATH_PSY_ADO_CTX)
+    sud_ctx, _ = split_ctx_sctx(sud)
+    psyP_ctx, _ = split_ctx_sctx(psyP)
+    return pd.concat([
+        ensure_unique_cols(sud_ctx, "SUD_"),
+        ensure_unique_cols(psyP_ctx, "PSYped_"),
+        ensure_unique_cols(psyP_ctx_only, "PSYpedctx_"),
+    ], axis=1)
+
+def build_adolescents_sctx():
+    sud = read_excel_numeric(PATH_SUD).drop(columns=["SUD"], errors="ignore")
+    psyP = read_excel_numeric(PATH_PSY_ADO_ALL)
+    _, sud_s = split_ctx_sctx(sud)
+    _, psyP_s = split_ctx_sctx(psyP)
+    return pd.concat([
+        ensure_unique_cols(sud_s, "SUD_"),
+        ensure_unique_cols(psyP_s, "PSYped_"),
+    ], axis=1)
+
+# ======================
+# BUILD MATRICES (FDR q-values)
+# ======================
+def build_adults_ctx_q():
+    sudq = read_excel_numeric(PATH_SUD_Q).drop(columns=["SUD"], errors="ignore")
+    psyq = read_excel_numeric(PATH_PSY_ADULTS_ALL_Q)
+    sud_ctx, _ = split_ctx_sctx(sudq)
+    psy_ctx, _ = split_ctx_sctx(psyq)
+    return pd.concat([
+        ensure_unique_cols(sud_ctx, "SUD_"),
+        ensure_unique_cols(psy_ctx, "PSYad_"),
+    ], axis=1)
+
+def build_adults_sctx_q():
+    sudq = read_excel_numeric(PATH_SUD_Q).drop(columns=["SUD"], errors="ignore")
+    psyq = read_excel_numeric(PATH_PSY_ADULTS_ALL_Q)
+    _, sud_s = split_ctx_sctx(sudq)
+    _, psy_s = split_ctx_sctx(psyq)
+    return pd.concat([
+        ensure_unique_cols(sud_s, "SUD_"),
+        ensure_unique_cols(psy_s, "PSYad_"),
+    ], axis=1)
+
+def build_adolescents_ctx_q():
+    sudq = read_excel_numeric(PATH_SUD_Q).drop(columns=["SUD"], errors="ignore")
+    psyq = read_excel_numeric(PATH_PSY_ADO_ALL_Q)
+    psyq_ctx_only = read_excel_numeric(PATH_PSY_ADO_CTX_Q)
+    sud_ctx, _ = split_ctx_sctx(sudq)
+    psy_ctx, _ = split_ctx_sctx(psyq)
+    return pd.concat([
+        ensure_unique_cols(sud_ctx, "SUD_"),
+        ensure_unique_cols(psy_ctx, "PSYped_"),
+        ensure_unique_cols(psyq_ctx_only, "PSYpedctx_"),
+    ], axis=1)
+
+def build_adolescents_sctx_q():
+    sudq = read_excel_numeric(PATH_SUD_Q).drop(columns=["SUD"], errors="ignore")
+    psyq = read_excel_numeric(PATH_PSY_ADO_ALL_Q)
+    _, sud_s = split_ctx_sctx(sudq)
+    _, psy_s = split_ctx_sctx(psyq)
+    return pd.concat([
+        ensure_unique_cols(sud_s, "SUD_"),
+        ensure_unique_cols(psy_s, "PSYped_"),
+    ], axis=1)
+
+# ======================
+# CLUSTER MATRICES (ADULTS)
+# ======================
+def build_cluster_ctx(cluster_disorders):
+    sud = read_excel_numeric(PATH_SUD)[["SUD"]]
+    psyA = read_excel_numeric(PATH_PSY_ADULTS_ALL)[cluster_disorders]
+    sud_ctx, _ = split_ctx_sctx(sud)
+    psy_ctx, _ = split_ctx_sctx(psyA)
+    return pd.concat([
+        ensure_unique_cols(sud_ctx, "SUD_"),
+        ensure_unique_cols(psy_ctx, "CLUSTER_"),
+    ], axis=1)
+
+def build_cluster_sctx(cluster_disorders):
+    sud = read_excel_numeric(PATH_SUD)[["SUD"]]
+    psyA = read_excel_numeric(PATH_PSY_ADULTS_ALL)[cluster_disorders]
+    _, sud_s = split_ctx_sctx(sud)
+    _, psy_s = split_ctx_sctx(psyA)
+    return pd.concat([
+        ensure_unique_cols(sud_s, "SUD_"),
+        ensure_unique_cols(psy_s, "CLUSTER_"),
+    ], axis=1)
+
+def build_cluster_ctx_q(cluster_disorders):
+    sudq = read_excel_numeric(PATH_SUD_Q)[["SUD"]]
+    psyq = read_excel_numeric(PATH_PSY_ADULTS_ALL_Q)[cluster_disorders]
+    sud_ctx, _ = split_ctx_sctx(sudq)
+    psy_ctx, _ = split_ctx_sctx(psyq)
+    return pd.concat([
+        ensure_unique_cols(sud_ctx, "SUD_"),
+        ensure_unique_cols(psy_ctx, "CLUSTER_"),
+    ], axis=1)
+
+def build_cluster_sctx_q(cluster_disorders):
+    sudq = read_excel_numeric(PATH_SUD_Q)[["SUD"]]
+    psyq = read_excel_numeric(PATH_PSY_ADULTS_ALL_Q)[cluster_disorders]
+    _, sud_s = split_ctx_sctx(sudq)
+    _, psy_s = split_ctx_sctx(psyq)
+    return pd.concat([
+        ensure_unique_cols(sud_s, "SUD_"),
+        ensure_unique_cols(psy_s, "CLUSTER_"),
+    ], axis=1)
+
+# ======================
+# RUN
+# ======================
+print(f"Saving outputs to: {OUTDIR}")
+
+X_ad_ctx = build_adults_ctx()
+X_ad_s = build_adults_sctx()
+X_ped_ctx = build_adolescents_ctx()
+X_ped_s = build_adolescents_sctx()
+
+Q_ad_ctx = build_adults_ctx_q()
+Q_ad_s = build_adults_sctx_q()
+Q_ped_ctx = build_adolescents_ctx_q()
+Q_ped_s = build_adolescents_sctx_q()
+
+for top_pct in TOP_PCTS:
+    out, meta = compute_overlap_rms_negative_tail_topk_fdr(X_ad_ctx, Q_ad_ctx, top_pct, DKT68, alpha=ALPHA_Q)
+    save_outputs("ADULTS_ALLDISORDERS_CTX", out, meta)
+    plot_overlap_ctx("ADULTS_ALLDISORDERS_CTX", out, top_pct)
+
+    out, meta = compute_overlap_rms_negative_tail_topk_fdr(X_ad_s, Q_ad_s, top_pct, SV14, alpha=ALPHA_Q)
+    save_outputs("ADULTS_ALLDISORDERS_SCTX", out, meta)
+    plot_overlap_sctx("ADULTS_ALLDISORDERS_SCTX", out, top_pct)
+
+    out, meta = compute_overlap_rms_negative_tail_topk_fdr(X_ped_ctx, Q_ped_ctx, top_pct, DKT68, alpha=ALPHA_Q)
+    save_outputs("ADOLESCENTS_ALLDISORDERS_CTX", out, meta)
+    plot_overlap_ctx("ADOLESCENTS_ALLDISORDERS_CTX", out, top_pct)
+
+    out, meta = compute_overlap_rms_negative_tail_topk_fdr(X_ped_s, Q_ped_s, top_pct, SV14, alpha=ALPHA_Q)
+    save_outputs("ADOLESCENTS_ALLDISORDERS_SCTX", out, meta)
+    plot_overlap_sctx("ADOLESCENTS_ALLDISORDERS_SCTX", out, top_pct)
+
+    for cname, disorders in CLUSTERS.items():
+        Xc = build_cluster_ctx(disorders)
+        Xs = build_cluster_sctx(disorders)
+        Qc = build_cluster_ctx_q(disorders)
+        Qs = build_cluster_sctx_q(disorders)
+
+        out, meta = compute_overlap_rms_negative_tail_topk_fdr(Xc, Qc, top_pct, DKT68, alpha=ALPHA_Q)
+        save_outputs(f"ADULTS_CLUSTER_{cname}_CTX", out, meta)
+        plot_overlap_ctx(f"ADULTS_CLUSTER_{cname}_CTX", out, top_pct)
+
+        out, meta = compute_overlap_rms_negative_tail_topk_fdr(Xs, Qs, top_pct, SV14, alpha=ALPHA_Q)
+        save_outputs(f"ADULTS_CLUSTER_{cname}_SCTX", out, meta)
+        plot_overlap_sctx(f"ADULTS_CLUSTER_{cname}_SCTX", out, top_pct)
+
+print("✅ Done: overlap = RMS(PSY_frac, SUD_frac) after FDR q<0.05 + top-k negative tail.")
